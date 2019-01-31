@@ -1,3 +1,4 @@
+# 参考：https://blog.csdn.net/chuigedaqiqiu/article/details/79641974
 """Contains a variant of the densenet model definition."""
 
 from __future__ import absolute_import
@@ -11,7 +12,10 @@ slim = tf.contrib.slim
 
 def trunc_normal(stddev): return tf.truncated_normal_initializer(stddev=stddev)
 
-
+"""
+    Args:
+    num_outputs: 输出通道数
+"""
 def bn_act_conv_drp(current, num_outputs, kernel_size, scope='block'):
     current = slim.batch_norm(current, scope=scope + '_bn')
     current = tf.nn.relu(current)
@@ -19,7 +23,11 @@ def bn_act_conv_drp(current, num_outputs, kernel_size, scope='block'):
     current = slim.dropout(current, scope=scope + '_dropout')
     return current
 
-
+"""
+    Args:
+    layers: dense block包含的网络层数
+    growth: 增长率
+"""
 def block(net, layers, growth, scope='block'):
     for idx in range(layers):
         bottleneck = bn_act_conv_drp(net, 4 * growth, [1, 1],
@@ -29,7 +37,14 @@ def block(net, layers, growth, scope='block'):
         net = tf.concat(axis=3, values=[net, tmp])
     return net
 
+# 主要是作了卷积和池化操作，改变了feature map的size和深度
+# 相邻两个dense block之间使用一个1x1的卷积层再接一个2x2的平均池化层作为转换层
+def transition(net, num_outputs, scope='transition'):
+    net = bn_act_conv_drp(net, num_outputs, [1, 1], scope=scope + '_conv1x1')
+    net = slim.avg_pool2d(net, [2, 2], stride=2, scope=scope + '_avgpool')
+    return net
 
+# ImageNet数据集上，增长率为24，压缩率是0.5
 def densenet(images, num_classes=1001, is_training=False,
              dropout_keep_prob=0.8,
              scope='densenet'):
@@ -60,10 +75,35 @@ def densenet(images, num_classes=1001, is_training=False,
     with tf.variable_scope(scope, 'DenseNet', [images, num_classes]):
         with slim.arg_scope(bn_drp_scope(is_training=is_training,
                                          keep_prob=dropout_keep_prob)) as ssc:
-            pass
-            ##########################
-            # Put your code here.
-            ##########################
+            net = images
+            net = slim.conv2d(net, 2*growth, 7, stride=2, scope='conv1')
+            net = slim.max_pool2d(net, 3, stride=2, padding='SAME', scope='pool1')
+    
+            net = block(net, 6, growth, scope='block1')
+            net = transition(net, reduce_dim(net), scope='transition1')
+            net = slim.avg_pool2d(net, [2, 2], stride=2, scope='avgpool1')
+        
+            net = block(net, 12, growth, scope='block2')
+            net = transition(net, reduce_dim(net), scope='transition2')
+            
+            net = block(net, 24, growth, scope='block3')
+            net = transition(net, reduce_dim(net), scope='transition3')
+            
+            net = block(net, 16, growth, scope='block4')
+            net = slim.batch_norm(net, scope='last_batch_norm_relu')
+            net = tf.nn.relu(net)
+            
+            # Global average pooling.
+            net = tf.reduce_mean(net, [1, 2], name='pool2', keep_dims=True)
+            
+            biases_initializer = tf.constant_initializer(0.1)
+            net = slim.conv2d(net, num_classes, [1, 1], biases_initializer=biases_initializer, scope='logits')
+            
+            logits = tf.squeeze(net, [1, 2], name='SpatialSqueeze')
+            
+            # 在最后一个dense block之后，使用一个全局平均池化层，紧接着就是softmax分类器
+            end_points['Logits'] = logits
+            end_points['predictions'] = slim.softmax(logits, scope='predictions')
 
     return logits, end_points
 
